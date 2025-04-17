@@ -1,0 +1,1174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="/baseex.js"></script>
+    <script src="/bootstrap.min.js"></script>
+    <script src="/marked.min.js"></script>
+    <script src="/pako.js"></script>
+    <link rel="shortcut icon" href="/logo.svg" type="image/svg">
+    <link rel="stylesheet" href="/bootstrap.min.css">
+    <script>
+        console.log(location.hostname);
+
+        if (location.hostname === "hornchat.minteck.org") {
+            window.HornchatServers = {
+                authentication: "wss://hornchat.minteck.org/api/authentication",
+                keyserver: "wss://hornchat.minteck.org/api/keyserver",
+                profile: "wss://hornchat.minteck.org/api/profile",
+                verification: "wss://hornchat.minteck.org/api/verification",
+                presence: "wss://hornchat.minteck.org/api/presence",
+                conversation: "wss://hornchat.minteck.org/api/conversation"
+            }
+        } else {
+            window.HornchatServers = {
+                authentication: "ws://localhost:8301",
+                keyserver: "ws://localhost:8302",
+                profile: "ws://localhost:8303",
+                verification: "ws://localhost:8304",
+                presence: "ws://localhost:8305",
+                conversation: "ws://localhost:8306"
+            }
+        }
+
+        async function application() {
+            document.getElementById("peer").value = await HornchatDB.getItem("server-peer") ?? "";
+            await start();
+            Hornchat.timelineBottom();
+
+            window.newPeerSafetyNumber = await HornchatDB.getItem("peer-safety-number");
+
+            window.devices = null;
+            window.peerOnline = false;
+
+            Hornchat.onreceive["presence"] = async (data) => {
+                if (data.username === peer && data.data) {
+                    window.peerOnline = data.data.length > 0;
+                }
+            }
+
+            Hornchat.onreceive["keyserver"] = async (data, deviceRemoval) => {
+                if (data.device) {
+                    window.currentDevice = data.device;
+
+                    if (deviceRemoval) {
+                        deviceRemovalServer.send(JSON.stringify({
+                            type: "disconnect",
+                            device: deviceToRemoveId
+                        }))
+                    }
+
+                    return;
+                }
+
+                if (data.error === null || !data.error) {
+                    if (!data.keys) {
+                        if (data.devices) {
+                            window.devices = data.devices;
+                            if (deviceRemoval) {
+                                refreshDeviceManager();
+                                deviceRemovalServer.close();
+                            } else {
+                                keyserver.close();
+                            }
+                        } else {
+                            keyserver.send(JSON.stringify({
+                                type: "read",
+                                username: window.peer
+                            }))
+                        }
+                    } else {
+                        document.getElementById("loader-message").innerText = "Loading keys...";
+                        let keys = {};
+                        for (let index of Object.keys(data.keys)) {
+                            keys[index] = await crypto.subtle.importKey("jwk", data.keys[index], {name: "ECDH", namedCurve: "P-256"}, false, []);
+                        }
+
+                        window.publicKeys = keys;
+                        window.privateKey = await crypto.subtle.importKey("jwk", JSON.parse(await HornchatDB.getItem("local-keypair")).privateKey, {name: "ECDH", namedCurve: "P-256"}, false, ["deriveKey"]);
+
+                        window.secretKeys = [];
+                        for (let device of Object.keys(window.publicKeys)) {
+                            let key = window.publicKeys[device];
+
+                            window.secretKeys.push({source: window.currentDevice, target: device, secret: await crypto.subtle.deriveKey({"name": "ECDH", "public": key}, privateKey, {name:"AES-CTR", length: 256}, true, ["encrypt", "decrypt"])})
+                        }
+
+                        keyserver.send(JSON.stringify({
+                            type: "list"
+                        }))
+                    }
+                } else {
+                    HornchatDB.removeItem("device-login-info");
+                    await start();
+                }
+            }
+
+            Hornchat.onreceive["conversation"] = async (data) => {
+                if (data.type === "message") {
+                    if (await HornchatDB.getItem("message-index") === null) HornchatDB.setItem("message-index", "{}");
+                    let index = JSON.parse(await HornchatDB.getItem("message-index"));
+                    index[data.data.uuid] = data.data.id;
+
+                    if (data._callback) {
+                        for (let file of data.data.attachments) {
+                            data.data.attachments = window.attachedFiles.map((i) => {
+                                return {
+                                    metadata: null,
+                                    contents: null,
+                                    _originalContents: i._originalContents,
+                                    _originalMetadata: i._originalMetadata
+                                }
+                            });
+                        }
+
+                        data.data.text = null;
+
+                        try {
+                            data.originalText = Hornchat.detectSystemMember(document.getElementById("composer-text").value, true).text;
+                        } catch (e) {
+                            data.originalText = document.getElementById("composer-text").value;
+                        }
+                    }
+
+                    HornchatDB.setItem("message-index", JSON.stringify(index));
+                    HornchatDB.setItem("message-" + data.data.id, JSON.stringify(data));
+
+                    if (!data._callback) window.hasUnreadMessages = true;
+                    if (!data._callback) document.getElementById("typing-indicator").style.display = "none";
+                    if (document.getElementById(`message-${data.data.uuid}-container`) === null) document.getElementById("timeline-messages").innerHTML += `<div id="message-${data.data.uuid}-container"></div>`;
+                    await Hornchat.drawMessage(data.data.uuid);
+                    Hornchat.timelineBottom();
+                }
+
+                if (data.type === "typing") {
+                    // Remember the cursed thing Mossy did on the server?
+                    // Well now it's on the client; removing this code
+                    // makes it break... sometimes, so I'm leaving it here.
+                    // This makes decryption 2x slower, but it also works
+                    // 100% of the time with that.
+                    // - Minty, Raindrops System
+                    let _ = [
+                        data.text,
+                        await Hornchat.decrypt(data.text),
+                        data.position,
+                        await Hornchat.decrypt(data.position),
+                        JSON.parse(await Hornchat.decrypt(data.position))
+                    ];
+
+                    await Hornchat.processTypingEvent(await Hornchat.decrypt(data.text), JSON.parse(await Hornchat.decrypt(data.position)), data.reply ?? null, data.attachments ?? 0);
+                } else if (data._callback) {
+                    window.replyingTo = null;
+                    window.attachedFiles = [];
+
+                    document.getElementById("footer-input").classList.remove("hasItem");
+                    document.getElementById("footer-input").classList.remove("hasItem2");
+                    document.getElementById("footer-item").innerHTML = "";
+                    document.getElementById("footer-item2").innerHTML = "";
+
+                    document.getElementById("composer-text").value = "";
+                    document.getElementById("composer-text").disabled = false;
+                    document.getElementById("footer-actions").classList.remove("disabled");
+                    document.getElementById("footer-item").classList.remove("disabled");
+                    document.getElementById("footer-item2").classList.remove("disabled");
+                    document.getElementById("composer-text").focus();
+
+                    await Hornchat.dispatchTypingEvent();
+                }
+
+                if (data.type === "status_update") {
+                    try {
+                        let message = JSON.parse(await HornchatDB.getItem("message-" + JSON.parse(await HornchatDB.getItem("message-index"))[data.data.message]));
+                        message.data.status = data.data.status;
+                        HornchatDB.setItem("message-" + message.data.id, JSON.stringify(message));
+
+                        await Hornchat.drawMessage(data.data.message);
+                    } catch (e) {}
+                }
+            }
+
+            window.SafetyNumber = {
+                local: null,
+                remote: null
+            }
+            Hornchat.onreceive["verification"] = async (data) => {
+                if (data.success) {
+                    let snid;
+
+                    if (data.username === peer) {
+                        snid = "sn1";
+                        SafetyNumber.remote = data.data;
+                    } else {
+                        snid = "sn0";
+                        SafetyNumber.local = data.data;
+                    }
+
+                    document.getElementById(snid + "-text").innerHTML = data.data.parts[0] + " " + data.data.parts[1] + " " + data.data.parts[2] + " " + data.data.parts[3] + " " + data.data.parts[4] + " " + data.data.parts[5] + "<br>" + data.data.parts[6] + " " + data.data.parts[7] + " " + data.data.parts[8] + " " + data.data.parts[9] + " " + data.data.parts[10] + " " + data.data.parts[11];
+                    document.getElementById(snid + "b-text").innerHTML = data.data.parts[0] + " " + data.data.parts[1] + " " + data.data.parts[2] + " " + data.data.parts[3] + " " + data.data.parts[4] + " " + data.data.parts[5] + "<br>" + data.data.parts[6] + " " + data.data.parts[7] + " " + data.data.parts[8] + " " + data.data.parts[9] + " " + data.data.parts[10] + " " + data.data.parts[11];
+
+                    let index = 1;
+                    for (let color of data.data.colors) {
+                        document.getElementById(snid + "-color-" + index).style.backgroundColor = "#" + color;
+                        document.getElementById(snid + "b-color-" + index).style.backgroundColor = "#" + color;
+
+                        index++;
+                    }
+
+                    if (data.username === peer) {
+                        window.newPeerSafetyNumber = data.data.raw;
+                        if (await HornchatDB.getItem("peer-safety-number") !== null && await HornchatDB.getItem("peer-safety-number") !== data.data.raw) {
+                            console.warn("Peer got their safety number changed, not yet verified; run `verifySafetyNumber()` to verify it.");
+                        } else {
+                            HornchatDB.setItem("peer-safety-number", data.data.raw);
+                        }
+                    }
+                }
+            }
+
+            window.deviceDeleteIntervals = {};
+        }
+
+        async function start() {
+            window.peer = await HornchatDB.getItem("server-peer");
+
+            if (await HornchatDB.getItem("device-login-info") !== null && await HornchatDB.getItem("local-keypair") !== null && await HornchatDB.getItem("server-peer") !== null) {
+                await Hornchat.checkToken(JSON.parse(await HornchatDB.getItem("device-login-info")), async () => {
+                    await login(JSON.parse(await HornchatDB.getItem("device-login-info")));
+                }, interactiveAuthentication);
+            } else {
+                await Hornchat.checkToken({username:"invalid",token:"invalid"}, () => {
+                    login({username:"invalid",token:"invalid"});
+                }, interactiveAuthentication);
+            }
+        }
+
+        async function interactiveAuthentication() {
+            document.getElementById("loader").style.display = "none";
+            document.getElementById("login").style.display = "";
+        }
+
+        async function authenticate(username, totp) {
+            let authentication = new WebSocket(HornchatServers.authentication);
+            authentication.onopen = () => {
+                console.log("[authentication] Connection established");
+                authentication.send(JSON.stringify({
+                    username,
+                    totp
+                }));
+            }
+
+            authentication.onclose = (e) => {
+                if (e.wasClean) {
+                    console.log("[authentication] Connection closed normally (code " + e.code + ")");
+                } else {
+                    console.log("[authentication] Connection closed unexpectedly (code " + e.code + ")");
+                    loginError("Unable to connect to the authentication server");
+                }
+            }
+
+            authentication.onmessage = async (e) => {
+                let data = JSON.parse(e.data);
+                console.log("[authentication] ", data);
+
+                if (data.error === null) {
+                    HornchatDB.setItem("device-login-info", JSON.stringify({
+                        username: username,
+                        token: data.device.token
+                    }));
+
+                    await generateKeyPair();
+                    await login({
+                        username: username,
+                        token: data.device.token
+                    });
+                } else {
+                    switch (data.error) {
+                        case "USER_NOT_FOUND":
+                            await loginError("This user does not exist (USER_NOT_FOUND).");
+                            break;
+
+                        case "INVALID_TOTP":
+                            await loginError("The entered 2FA code is incorrect (INVALID_TOTP).");
+                            break;
+
+                        case "RATE_LIMITED":
+                            await loginError("You are being rate limited, please try again later (RATE_LIMITED).");
+                            break;
+
+                        case "MISSING_OPERAND":
+                            await loginError("The server didn't receive all the data needed (MISSING_OPERAND).");
+                            break;
+
+                        case "INVALID_DATA":
+                            await loginError("The server didn't receive the data in a usable state (INVALID_DATA).");
+                            break;
+
+                        case "INTERNAL_ERROR":
+                            await loginError("An internal server error occurred, please contact the developers (INTERNAL_ERROR).");
+                            break;
+
+                        default:
+                            await loginError(data.error);
+                            break;
+                    }
+                }
+            }
+        }
+
+        async function login(loginInfo) {
+            window.inLoginProcess = true;
+            document.getElementById("loader").style.display = "none";
+            document.getElementById("login").style.display = "";
+            document.getElementById("login-form").style.display = "none";
+            document.getElementById("login-progress").style.display = "";
+            await Hornchat.connect(loginInfo);
+
+            window.waitForLoginSuccess = setInterval(() => {
+                if (window.successCode >= 11) {
+                    clearInterval(window.waitForLoginSuccess);
+
+                    Hornchat.timelineBottom();
+                    setInterval(mainLoop, 500);
+                    mainLoop();
+                }
+            }, 500)
+        }
+
+        async function generateKeyPair() {
+            document.getElementById("loader-message").innerText = "Generating encryption keys...";
+            let keypair = await crypto.subtle.generateKey({name:"ECDH", namedCurve: "P-256"}, true, ["deriveKey"]);
+
+            HornchatDB.setItem("local-keypair", JSON.stringify({
+                privateKey: await crypto.subtle.exportKey("jwk", keypair.privateKey),
+                publicKey: await crypto.subtle.exportKey("jwk", keypair.publicKey)
+            }));
+
+            return JSON.parse(await HornchatDB.getItem("local-keypair"));
+        }
+
+        function verifySafetyNumber() {
+            HornchatDB.setItem("peer-safety-number", SafetyNumber.remote.raw);
+            return true;
+        }
+
+        function checkIfCanLogin() {
+            let username = document.getElementById("username").value;
+            let totp = document.getElementById("totp").value;
+            let peer = document.getElementById("peer").value;
+
+            document.getElementById("login-btn").disabled = !(username.trim().length > 1 && totp.trim().replace(/^\D$/g, "").length === 6 && peer.trim().length > 1);
+        }
+
+        function interactiveLogin() {
+            checkIfCanLogin();
+            if (document.getElementById("login-btn").disabled) return;
+
+            let username = document.getElementById("username").value.trim();
+            let totp = document.getElementById("totp").value.trim();
+            let peer = document.getElementById("peer").value.trim();
+
+            document.getElementById("login-form").style.display = "none";
+            document.getElementById("login-error").style.display = "none";
+            document.getElementById("login-progress").style.display = "";
+
+            HornchatDB.setItem("server-peer", peer);
+            authenticate(username, totp);
+        }
+
+        async function loginError(message) {
+            document.getElementById("loader").style.display = "none";
+            document.getElementById("login").style.display = "";
+            document.getElementById("login-progress").style.display = "none";
+            document.getElementById("login-error").style.display = "";
+            document.getElementById("login-error-message").innerText = message;
+            document.getElementById("login-form").style.display = "";
+
+            document.getElementById("username").value = "";
+            document.getElementById("totp").value = "";
+            document.getElementById("peer").value = await HornchatDB.getItem("server-peer") ?? "";
+
+            checkIfCanLogin();
+        }
+
+        let lastKnownConnections = 0
+        async function mainLoop() {
+            if (window.connectedServers > lastKnownConnections) {
+                Hornchat.online();
+            } else if (window.connectedServers < lastKnownConnections) {
+                Hornchat.offline();
+            }
+
+            lastKnownConnections = window.connectedServers;
+
+            document.getElementById("peer-picture").src = "/assets/" + Hornchat.resolvePluralKit("remote", PluralKit.remote.fronters[0]).id + "/64.jpg";
+            document.getElementById("peer-name").innerText = document.getElementById("body-unverified-username4").innerText = document.getElementById("body-unverified-username3").innerText = document.getElementById("body-unverified-username2").innerText = document.getElementById("body-unverified-username").innerText = Hornchat.resolvePluralKit("remote", PluralKit.remote.fronters[0]).name;
+
+            if (await HornchatDB.getItem("peer-safety-number") !== null && await HornchatDB.getItem("peer-safety-number") !== window.newPeerSafetyNumber) {
+                document.getElementById("peer-unverified").style.display = "";
+                document.getElementById("footer-input").style.display = "none";
+                document.getElementById("footer-unverified").style.display = "flex";
+                document.getElementById("unverified").style.display = "flex";
+            } else {
+                document.getElementById("footer-unverified").style.display = "none";
+                document.getElementById("footer-input").style.display = "";
+                document.getElementById("peer-unverified").style.display = "none";
+                document.getElementById("unverified").style.display = "none";
+            }
+
+            if (window.peerOnline) {
+                document.getElementById("peer-status").style.backgroundColor = "#1bb60b";
+            } else {
+                document.getElementById("peer-status").style.backgroundColor = "#888888";
+            }
+
+            if (document.hasFocus()) { // App focused
+                if (window.hasUnreadMessages) {
+                    conversation.send(JSON.stringify({
+                        type: "read"
+                    }));
+
+                    window.hasUnreadMessages = false;
+                }
+            }
+        }
+
+        function refreshDeviceManager() {
+            for (let interval of Object.keys(window.deviceDeleteIntervals)) {
+                try { clearInterval(window.deviceDeleteIntervals[interval]) } catch (e) {}
+            }
+
+            document.getElementById("device-manager-loader").style.display = "";
+            document.getElementById("device-manager-list").style.display = "none";
+            document.getElementById("device-manager-list").innerHTML = "";
+
+            let example = document.getElementById("device-manager-example");
+
+            for (let device of devices.sort((a, b) => {
+                return new Date(b.dates.last).getTime() - new Date(a.dates.last).getTime();
+            })) {
+                example.id = "device-manager-device-" + device.id;
+                document.getElementById("device-manager-list").innerHTML += example.outerHTML;
+                example.id = "device-manager-example";
+                let el = document.getElementById("device-manager-device-" + device.id);
+
+                el.innerHTML = el.innerHTML.replace("{DESCRIPTION}", device.platform.replaceAll("<", "-").replaceAll(">", "-"));
+                el.innerHTML = el.innerHTML.replace("{FIRST}", new Date(device.dates.first).toDateString() + " " + new Date(device.dates.first).toTimeString().split(" ")[0]);
+                el.innerHTML = el.innerHTML.replace("{LAST}", new Date(device.dates.last).toDateString() + " " + new Date(device.dates.last).toTimeString().split(" ")[0]);
+                el.innerHTML = el.innerHTML.replace("{ADDRESSES}", "<li><code>" + device.addresses.join("</li></code><li><code>") + "</code></li>");
+                el.innerHTML = el.innerHTML.replace("{ADDRESSESCOUNT}", device.addresses.length);
+
+                if (device.id === window.currentDevice) {
+                    el.innerHTML = el.innerHTML.replace("{thisdevicestyle}", "");
+                } else {
+                    el.innerHTML = el.innerHTML.replace("{thisdevicestyle}", 'style="display:none;"');
+                }
+            }
+
+            document.getElementById("device-manager-loader").style.display = "none";
+            document.getElementById("device-manager-list").style.display = "";
+
+            for (let device of Array.from(document.getElementsByClassName("device-manager-delete"))) {
+                let id = device.parentElement.id;
+                if (id.endsWith("-example")) continue;
+
+                let uuid = id.substring(22);
+                let yesButton = Array.from(document.getElementsByClassName("device-manager-delete-yes")).filter((i) => {
+                    return i.parentElement.parentElement.parentElement.id.substring(22) === uuid;
+                })[0];
+
+                device.onclick = () => {
+                    let confirm = Array.from(document.getElementById("device-manager-device-" + uuid).children).filter((i) => {
+                        return i.classList.contains("device-manager-delete-confirm");
+                    })[0];
+                    confirm.style.display = "";
+                    device.style.display = "none";
+                    yesButton.disabled = true;
+                    yesButton.innerText = "Yes (5)";
+
+                    window.deviceDeleteIntervals[uuid] = setInterval(() => {
+                        let count = parseInt(yesButton.innerText.split("(")[1].split(")")[0]);
+                        if (count <= 1) {
+                            yesButton.disabled = false;
+                            yesButton.innerText = "Yes";
+                            clearInterval(window.deviceDeleteIntervals[uuid]);
+                        } else {
+                            yesButton.disabled = true;
+                            yesButton.innerText = "Yes (" + (count - 1) + ")";
+                        }
+                    }, 1000)
+                }
+            }
+
+            for (let device of Array.from(document.getElementsByClassName("device-manager-delete-yes"))) {
+                let id = device.parentElement.parentElement.parentElement.id;
+                if (id.endsWith("-example")) continue;
+
+                let uuid = id.substring(22);
+                device.onclick = () => {
+                    let yesButton = Array.from(document.getElementsByClassName("device-manager-delete-yes")).filter((i) => {
+                        return i.parentElement.parentElement.parentElement.id.substring(22) === uuid;
+                    })[0];
+                    let noButton = Array.from(document.getElementsByClassName("device-manager-delete-no")).filter((i) => {
+                        return i.parentElement.parentElement.parentElement.id.substring(22) === uuid;
+                    })[0];
+
+                    yesButton.disabled = true;
+                    noButton.disabled = true;
+
+                    Hornchat.deleteDevice(uuid, () => {
+                        if (uuid === window.currentDevice) {
+                            // TODO: Clear database
+                            location.reload();
+                        }
+                    })
+                }
+            }
+
+            for (let device of Array.from(document.getElementsByClassName("device-manager-delete-no"))) {
+                let id = device.parentElement.parentElement.parentElement.id;
+                if (id.endsWith("-example")) continue;
+
+                let uuid = id.substring(22);
+                device.onclick = () => {
+                    try { clearInterval(window.deviceDeleteIntervals[uuid]) } catch (e) {}
+
+                    let confirm = Array.from(document.getElementById("device-manager-device-" + uuid).children).filter((i) => {
+                        return i.classList.contains("device-manager-delete-confirm");
+                    })[0];
+                    let deleteButton = Array.from(document.getElementsByClassName("device-manager-delete")).filter((i) => {
+                        return i.parentElement.id.substring(22) === uuid;
+                    })[0];
+
+                    confirm.style.display = "none";
+                    deleteButton.style.display = "";
+                }
+            }
+        }
+
+        async function processEnterKey(event) {
+            if (event.keyCode === 13 && !event.shiftKey) {
+                event.preventDefault();
+
+                if (document.getElementById("composer-text").value.trim() !== "") {
+                    await Hornchat.sendMessage(document.getElementById("composer-text").value.trim());
+                }
+            }
+        }
+    </script>
+    <meta charset="UTF-8">
+    <title>Hornchat</title>
+    <style>
+        html, body {
+            background: #222;
+            color: white;
+            font-family: sans-serif;
+        }
+
+        #timeline * {
+            word-wrap: break-word;
+        }
+
+        .alert {
+            filter: invert(1) hue-rotate(180deg);
+        }
+
+        .lnk:hover {
+            background-color: rgba(0, 0, 0, .1);
+        }
+
+        .lnk:active, .lnk:focus {
+            background-color: rgba(0, 0, 0, .25);
+        }
+
+        .modal-header {
+            border-bottom: 1px solid #353738;
+        }
+
+        .modal-content {
+            border: 1px solid rgba(255, 255, 255, .2);
+            background-color: #111;
+        }
+
+        .btn-close {
+            filter: invert(1);
+        }
+
+        .list-group-item {
+            color: #fff;
+            background-color: #222;
+            border: 1px solid rgba(255, 255, 255, .125);
+        }
+
+        .timeline-item {
+            margin: 10px 0;
+        }
+
+        .timeline-date {
+            text-align: center;
+        }
+
+        .timeline-switch {
+            text-align: center;
+            opacity: .5;
+        }
+
+        .timeline-message {
+            max-width: 60%;
+        }
+
+        .timeline-message-footer {
+            display: grid;
+            grid-template-columns: 1fr max-content;
+        }
+
+        .timeline-message-author {
+            font-size: 12px;
+            opacity: .75;
+            display: flex;
+            align-items: end;
+            justify-content: left;
+        }
+
+        .timeline-message-sent .timeline-message-footer {
+            grid-template-columns: 1fr max-content max-content;
+        }
+
+        .timeline-message-image {
+            display: block;
+            margin-bottom: 10px;
+            margin-top: -10px;
+            margin-left: -20px;
+            width: calc(100% + 40px);
+            background: #222;
+            border-top-left-radius: 24px;
+            border-top-right-radius: 24px;
+        }
+
+        .timeline-message-image > img {
+            width: 40vh;
+            border-top-left-radius: 25px;
+            border-top-right-radius: 25px;
+            display: block;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .timeline-message-received {
+            padding: 10px 20px;
+            border-radius: 25px;
+            width: max-content;
+            margin-right: auto;
+            margin-left: 0;
+        }
+
+        .timeline-message-received {
+            margin-right: auto;
+            margin-left: 0;
+        }
+
+        .timeline-message-sent {
+            padding: 10px 20px;
+            border-radius: 25px;
+            width: max-content;
+            margin-left: auto;
+            margin-right: 0;
+        }
+
+        .timeline-message-sent {
+            margin-left: auto;
+            margin-right: 0;
+        }
+
+        .timeline-message-date {
+            font-size: 12px;
+            opacity: .75;
+            display: flex;
+            align-items: end;
+            justify-content: right;
+            margin-left: 10px;
+        }
+
+        .timeline-message-status {
+            display: flex;
+            align-items: end;
+            justify-content: center;
+            margin-left: 5px;
+        }
+
+        .timeline-message-status > img {
+            width: 16px;
+            vertical-align: bottom;
+        }
+
+        .timeline-message-media {
+            max-width: 100%;
+        }
+
+        .timeline-message-media > * {
+            border-radius: 10px;
+            max-width: 100%;
+        }
+
+        @media (max-width: 767px) {
+            .timeline-message {
+                max-width: 90%;
+            }
+        }
+
+        .timeline-message-typing-caret {
+            font-weight: 100;
+            animation-name: caret;
+            animation-duration: 1s;
+            animation-iteration-count: infinite;
+            animation-timing-function: cubic-bezier(0, 3.08, 1, 2.76);
+        }
+
+        .timeline-message-typing-select {
+            background-color: rgba(255, 255, 255, .25);
+        }
+
+        @keyframes caret {
+            0%   { opacity: 0; }
+            50%  { opacity: 1; }
+            100% { opacity: 0; }
+        }
+
+        .timeline-message-typing-badge {
+            font-size: 12px;
+            background: rgba(255, 255, 255, .125);
+            padding: 5px 10px;
+            border-radius: 999px;
+            vertical-align: middle;
+        }
+
+        .timeline-message-typing-content {
+            vertical-align: middle;
+        }
+
+        .timeline-message-reply {
+            transition: transform 200ms;
+            color: inherit;
+            text-decoration: none;
+            display: block;
+            border-left-style: solid;
+            border-left-width: 5px;
+            padding: 5px 10px;
+            border-radius: 5px;
+            margin-bottom: 5px;
+        }
+
+        .timeline-message-reply:hover {
+            transform: scale(.9);
+            color: inherit;
+        }
+
+        .timeline-message-reply:focus, .timeline-message-reply:active {
+            transform: scale(.85);
+            color: inherit;
+        }
+
+        .timeline-message-reply-author {
+            display: block;
+            font-weight: bold;
+        }
+
+        * {
+            outline: none;
+        }
+
+        @media (max-width: 991px) {
+            #fullscreen-security-grid {
+                grid-template-columns: 1fr !important;
+            }
+
+            #fullscreen-security-grid > table {
+                margin-left: auto !important;
+                margin-right: auto !important;
+            }
+        }
+
+        .timeline-message {
+            cursor: pointer;
+            transition: transform 200ms;
+        }
+
+        .timeline-message:hover {
+            transform: scale(0.95);
+        }
+
+        .timeline-message:active {
+            transform: scale(0.8);
+        }
+
+        #footer-input {
+            height: 52px;
+        }
+
+        #footer-input.hasItem #composer-text, #footer-input.hasItem2 #composer-text {
+            height: 27px !important;
+        }
+
+        #footer-input.hasItem #footer-item, #footer-input.hasItem2 #footer-item2 {
+            display: inline-block;
+        }
+
+        .footer-item {
+            font-size: 12px;
+            background: rgba(255, 255, 255, .125);
+            padding: 2px 7px;
+            height: 24px;
+            border-bottom-left-radius: 10px;
+            border-bottom-right-radius: 10px;
+            vertical-align: middle;
+            position: relative;
+            top: -2px;
+            display: none;
+        }
+
+        .footer-item-cancel {
+            color: white;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .footer-item-cancel:hover {
+            color: white;
+            opacity: .75;
+        }
+
+        .footer-item-cancel:active, .footer-item-cancel:focus {
+            color: white;
+            opacity: .5;
+        }
+
+        ::-webkit-scrollbar {
+            width: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #000000;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #222;
+            border-radius: 999px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #444;
+        }
+
+        .footer-item.disabled, .footer-item2.disabled, #footer-actions.disabled {
+            opacity: .5;
+            pointer-events: none;
+        }
+
+        .timeline-message-file-link {
+            color: white !important;
+            background-color: rgba(0, 0, 0, .75);
+            padding: 5px 10px;
+            margin-bottom: 5px;
+            border-radius: 10px;
+            display: block;
+            text-decoration: none;
+        }
+
+        .timeline-message-file-link:hover {
+            opacity: .75;
+        }
+
+        .timeline-message-file-link:active {
+            opacity: .5;
+        }
+
+        .timeline-message-file-action * {
+            pointer-events: none;
+        }
+
+        #footer-inner {
+            display: grid;
+            grid-template-columns: max-content 1fr;
+            height: 52px;
+        }
+
+        #footer-actions {
+            padding-right: 10px;
+        }
+
+        #footer-actions img {
+            filter: invert(1);
+            width: 32px;
+            height: 32px;
+        }
+
+        #footer-actions a {
+            display: inline-block;
+            padding: 7px;
+            border-radius: 999px;
+            margin: 3px;
+            cursor: pointer;
+        }
+
+        #footer-actions a:hover {
+            background: rgba(0, 0, 0, .25);
+        }
+
+        #footer-actions a:active {
+            background: rgba(0, 0, 0, .5);
+        }
+    </style>
+</head>
+<body>
+    <div id="database-error" style="display:none;z-index:9999;align-items:start;justify-content: center;position:fixed;inset:0;background-color: black;" class="ps-5 pe-5">
+        <div class="ps-5 pe-5 pt-5" style="width:max-content;">
+            <img alt="" src="/database.svg" style="filter:invert(1);width:48px;height:48px;"><br>
+            <span style="font-size:20px;font-weight:bold;margin-top:10px;display:inline-block;" id="database-error-message">Database Error</span><br>
+            <span style="max-width:50%;display:inline-block;margin-top:10px;" id="database-error-description">This is bad.</span><br>
+            <button onclick="location.reload();" class="btn btn-outline-light" style="margin-top:10px;">Reload</button>
+        </div>
+    </div>
+
+    <div id="loader" style="display:flex;align-items:center;justify-content: center;position:fixed;inset:0;">
+        <div style="text-align: center;">
+            <img src="/logo.svg" style="width:128px;" alt=""><br>
+            <img src="/loader.svg" style="width:48px;vertical-align: middle;" alt="">
+            <span style="display:none;" id="loader-message">Checking session...</span>
+        </div>
+    </div>
+
+    <div id="login" style="position:fixed;inset:0;display:none;">
+        <div class="container">
+            <br>
+            <h2><img src="/logo.svg" style="width:64px;vertical-align: middle;" alt=""> <span style="vertical-align: middle;">Login to Hornchat</span></h2>
+            <br>
+
+            <div class="alert alert-warning">
+                <b>Hornchat is experimental.</b> Hornchat is currently being tested and may be unstable or contain bugs. Please report all bugs you encounter with screenshots from the developer console.
+            </div>
+
+            <div id="login-progress" class="alert alert-secondary" style="display:none;">
+                Logging in, please wait...
+            </div>
+
+            <div id="login-offline" class="alert alert-danger" style="display:none;">
+                Hornchat is offline, please try again later. (servers: <span id="login-offline-servers"></span>)
+                <script>
+                    document.getElementById("login-offline-servers").innerText = Object.values(window.HornchatServers).join(", ");
+                </script>
+            </div>
+
+            <div id="login-error" class="alert alert-danger" style="display:none;">
+                <b>Unable to login:</b> <span id="login-error-message">An error occurred.</span>
+            </div>
+
+            <div id="login-form">
+                <div id="login-grid" style="display:grid;grid-template-columns: 1fr 1fr 1fr; grid-gap: 10px;">
+                    <input onchange="checkIfCanLogin();" onkeydown="checkIfCanLogin();" onkeyup="checkIfCanLogin();" style="color:white;background:#252525;border-color:#444;" type="text" class="form-control" id="username" placeholder="Username">
+                    <input onchange="checkIfCanLogin();" onkeydown="checkIfCanLogin();" onkeyup="checkIfCanLogin();" style="color:white;background:#252525;border-color:#444;" type="number" class="form-control" id="totp" placeholder="2FA code" maxlength="6" max="999999" minlength="6">
+                    <input onchange="checkIfCanLogin();" onkeydown="checkIfCanLogin();" onkeyup="checkIfCanLogin();" style="color:white;background:#252525;border-color:#444;" type="text" class="form-control" id="peer" placeholder="Recipient">
+                </div>
+                <br>
+                <div style="text-align: center;">
+                    <button onclick="interactiveLogin();" id="login-btn" disabled type="button" class="btn btn-primary">Login</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="app" style="display:none;position:fixed;inset:0;">
+        <div id="header" style="background:#333;height:52px;padding:10px;position: fixed;top:0;left:0;right:0;">
+            <div class="container">
+                <img id="peer-picture" src="" style="background:#444;border-radius:999px;height:32px;width:32px;vertical-align: middle;">
+                <span id="peer-status" style="width: 14px;height: 14px;margin-top: 22px;background-color: #888888;display: inline-block;border-radius: 999px;vertical-align: middle;margin-left: -18px;position: absolute;border: 2px solid #333333;"></span>
+                <span id="peer-name" style="margin-left:5px;vertical-align: middle;"></span>
+                <span id="peer-unverified" class="badge bg-danger rounded-pill" style="vertical-align: middle;display: none;">Unverified</span>
+
+                <div id="buttons" style="float:right;">
+                    <a data-bs-toggle="modal" data-bs-target="#security-number" title="Security Number" class="lnk" style="border-radius:999px;cursor:pointer;padding: 9px;display:inline-block;margin-right: -6px;margin-top: -6px;">
+                        <img src="/securitynumber.svg" alt="" style="width:24px;height:24px;filter:invert(1);">
+                    </a>
+                    <a onclick="refreshDeviceManager();" data-bs-toggle="modal" data-bs-target="#device-manager" title="Device Manager" class="lnk" style="border-radius:999px;cursor:pointer;padding: 9px;display:inline-block;margin-right: -6px;margin-top: -6px;">
+                        <img src="/devices.svg" alt="" style="width:24px;height:24px;filter:invert(1);">
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <div id="body" style="background: black;position:fixed;top:52px;bottom:52px;left:0;right:0;">
+            <div id="unverified" style="z-index: 999999; display: flex;align-items: center;justify-content: center;height:100%;text-align: center;">
+                <div class="container">
+                    <h4>Your communications with <b id="body-unverified-username">User</b> may not be secure.</h4>
+                    <p><span id="body-unverified-username2">User</span>'s safety number changed from the last time you verified them. You have to make sure this security number matches what they see to ensure the security of your communications. Make sure all numbers match exactly what <span id="body-unverified-username3">User</span> see on their device. Note that the two blocks may not be in the same order.</p>
+                    <div id="fullscreen-security-grid" style="display:grid;grid-template-columns: 1fr 1fr;">
+                        <table style="width:max-content;margin-left:auto;border-spacing:10px 10px;border-collapse:separate;">
+                            <tr>
+                                <td id="sn0-color-1" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0-color-2" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0-color-3" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0-color-4" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0-color-5" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0-color-6" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                            </tr>
+                            <tr>
+                                <td id="sn0-text" colspan="6" style="font-family: monospace;height:24px;text-align:center;"></td>
+                            </tr>
+                        </table>
+                        <table style="width:max-content;border-spacing:10px 10px;border-collapse:separate;">
+                            <tr>
+                                <td id="sn1-color-1" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1-color-2" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1-color-3" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1-color-4" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1-color-5" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1-color-6" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                            </tr>
+                            <tr>
+                                <td id="sn1-text" colspan="6" style="font-family: monospace;height:24px;text-align:center;"></td>
+                            </tr>
+                        </table>
+                    </div>
+
+                    <button onclick="verifySafetyNumber();" type="button" class="btn btn-primary" style="margin-top:10px;">I see the same security number as <span id="body-unverified-username4">User</span></button>
+                </div>
+            </div>
+            <div class="container" id="timeline" style="z-index: 9;overflow: auto;height:calc(100vh - 104px);">
+                <div id="timeline-messages"></div>
+                <div id="typing-indicator" class="timeline-item timeline-message timeline-message-received timeline-message-typing" style="background-color: rgba(87,87,87,0.33);color: rgba(255, 255, 255, .5);display:none;">
+                    <div class="timeline-message-inner">
+                        <div class="timeline-message-text">
+                            <span class="timeline-message-typing-badge" id="typing-indicator-badge"></span>
+                            <span class="timeline-message-typing-badge" id="typing-indicator-badge2"></span>
+                            <span class="timeline-message-typing-content"><span id="typing-indicator-text"></span></span>
+                        </div>
+                    </div>
+                    <div class="timeline-message-footer">
+                        <span class="timeline-message-author" id="typing-indicator-author"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="footer" style="background:#333;height:52px;position:fixed;bottom:0;left:0;right:0;">
+            <div class="container" id="footer-online" style="height:100%;">
+                <div id="footer-input">
+                    <div id="footer-inner">
+                        <div id="footer-actions">
+                            <a onclick="Hornchat.attachFile();">
+                                <img src="/upload.svg" alt="Upload">
+                            </a>
+                        </div>
+                        <div id="footer-text">
+                            <span class="footer-item" id="footer-item">Something</span>
+                            <span class="footer-item" id="footer-item2">Something</span>
+                            <textarea onchange="Hornchat.dispatchTypingEvent();" onclick="Hornchat.dispatchTypingEvent();" onkeydown="processEnterKey(event); Hornchat.dispatchTypingEvent();" onkeyup="Hornchat.dispatchTypingEvent();" type="text" id="composer-text" placeholder="Message" style="border: none;resize: none;width: 100%;height: 100%;background: transparent;color: white;"></textarea>
+                        </div>
+                    </div>
+                </div>
+                <div id="footer-unverified" style="align-items:center;justify-content:center;text-align: center;display:none;height:100%;">
+                    You must verify the security number before you can send messages.
+                </div>
+            </div>
+            <div id="footer-offline" style="background-color: #362800; align-items:center;justify-content:center;text-align: center;display:none;height:100%;">
+                <div class="container" style="height:100%;display:flex;align-items:center;justify-content: center;text-align:center;">
+                    <div>
+                        <img src="/offline.svg" style="filter:invert(1);width:24px;height:24px;vertical-align: middle;"> <span style="vertical-align: middle;">Unable to connect to Hornchat, please check your connection.</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="device-manager">
+        <div class="modal-dialog">
+            <div class="modal-content">
+
+                <div class="modal-header">
+                    <h4 class="modal-title">Device Manager</h4>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+
+                <div class="modal-body" id="device-manager-body">
+                    <p>All devices that you connect to your Hornchat account appear here. Connecting a new device makes your security number change, which means your recipient will be made aware that you logged in from a new device.</p>
+                    <p>For your security, make sure you only keep devices you use and you disconnect all unrecognized/unused devices from your account.</p>
+                    <div id="device-manager-loader">
+                        Loading...
+                    </div>
+                    <ul id="device-manager-example-outer" class="list-group" style="display:none;">
+                        <li id="device-manager-example" class="list-group-item">
+                            <b>{DESCRIPTION}</b> <span {thisdevicestyle} class="badge bg-primary rounded-pill">This device</span><br>
+                            Last seen: <span>{FIRST}</span><br>
+                            First seen: <span>{LAST}</span>
+                            <details style="margin-left:20px;margin-top:10px;">
+                                <summary>Show IP addresses ({ADDRESSESCOUNT})</summary>
+                                <ul>
+                                    {ADDRESSES}
+                                </ul>
+                            </details>
+                            <button style="margin-top:5px;" class="btn btn-outline-danger device-manager-delete">Disconnect this device</button>
+                            <div class="device-manager-delete-confirm" style="margin-top:5px;display:none;">
+                                <div class="btn-group">
+                                    <button type="button" class="btn btn-success device-manager-delete-yes">Yes</button>
+                                    <button type="button" class="btn btn-danger device-manager-delete-no">No</button>
+                                </div>
+                            </div>
+                        </li>
+                    </ul>
+                    <div id="device-manager-list" class="list-group" style="display:none;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <div class="modal" id="security-number">
+        <div class="modal-dialog">
+            <div class="modal-content">
+
+                <div class="modal-header">
+                    <h4 class="modal-title">Security Number</h4>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+
+                <div class="modal-body" id="">
+                    <p>This security number ensures your communications are secure. It changes whenever you or your recipient logs in from a new device. If it changes frequently and unexpectedly, it might be a good idea to reset your 2FA codes.</p>
+                    <p>These two blocks may not be in the same order on your recipient's device.</p>
+                    <div>
+                        <table style="width:max-content;margin: 0 !important;border-spacing:10px 10px;border-collapse:separate;">
+                            <tr>
+                                <td id="sn0b-color-1" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0b-color-2" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0b-color-3" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0b-color-4" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0b-color-5" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn0b-color-6" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                            </tr>
+                            <tr>
+                                <td id="sn0b-text" colspan="6" style="font-family: monospace;height:24px;text-align:center;"></td>
+                            </tr>
+                        </table>
+                        <table style="margin:0 !important;width:max-content;border-spacing:10px 10px;border-collapse:separate;">
+                            <tr>
+                                <td id="sn1b-color-1" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1b-color-2" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1b-color-3" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1b-color-4" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1b-color-5" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                                <td id="sn1b-color-6" style="width:64px;height:24px;border-radius:999px;border:1px solid rgba(255, 255, 255, .5);"></td>
+                            </tr>
+                            <tr>
+                                <td id="sn1b-text" colspan="6" style="font-family: monospace;height:24px;text-align:center;"></td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        window.onresize = () => {
+            Hornchat.timelineBottom();
+        }
+    </script>
+    <script src="hornchat.js"></script>
+</body>
+</html>

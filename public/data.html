@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+  <script>alert(`effectiveType: ${navigator.connection.effectiveType}\ntype: ${navigator.connection.type}\ndownlink: ${navigator.connection.downlink}\nsaveData: ${navigator.connection.saveData}\nrtt: ${navigator.connection.rtt}\nHornchat.mobileData: ${navigator.connection.type === "cellular" || navigator.connection.type === "bluetooth" || navigator.connection.saveData}`);</script>
+</body>
+</html>
